@@ -212,3 +212,8 @@ To prevent scope creep, the following are explicitly deferred to post-1.0:
 | 4: OSS release | 2 weeks | 8–11 weeks |
 
 Full-time focused execution: ~10–12 weeks. Part-time or interrupted execution: meaningfully longer. Calendar duration should include buffer for the things you don't yet know are hard.
+
+
+# Work tracking
+
+16/05/2026: Implemented a very basic version of the POC described in 001_presentation_poc that can go from a high level course design to a series of slides, implementing basic control gating and orchestration. However, the newly created slides agent, that aligns with the POC design, loses out from the stylistic functionality of the agency swarm slides_agent. A preliminary analysis as to why is described in EXPLANATION.md in Task 002
