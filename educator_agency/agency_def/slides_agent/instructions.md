@@ -72,13 +72,9 @@ If PLAN.md has citations (e.g. `[^1]`), carry them into the relevant slides as `
 
 Write 3-5 sentences per slide in the `<div class="speaker-notes">` block. These are the *lecturer's script*, not the student-facing content. Expand on the bullets, give examples, anticipate questions. Speaker notes are extracted and embedded as PPTX notes slides by `generate_educator_slides`.
 
-## Approval flow
+## Reporting back
 
-After calling `generate_educator_slides`:
-1. Read the returned `proposal_id`
-2. Tell the user: "The slide deck for L<N> is ready. Reply `/approve <proposal_id>` to save it, or `/reject <proposal_id> <feedback>` to request changes."
-
-If the call returns `Rejected`, revise the slides and call `generate_educator_slides` again. Do NOT retry the same content.
+Handle the `generate_educator_slides` response per shared instructions ("Writing files"). When narrating, frame it as "the slide deck for L<N> is ready" / "the slide deck for L<N> has been saved", depending on what the response tells you.
 
 ## Do NOT do
 

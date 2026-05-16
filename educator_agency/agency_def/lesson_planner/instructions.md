@@ -51,9 +51,4 @@ title: <Lesson title>
 - To find the lesson directory: `list_files(path="lessons")` then match `lessons/L<N>-*`
 - Write output: `write_file(path="lessons/L<N>-<slug>/PLAN.md", content=<full content>)`
 
-After calling `write_file`, report the `proposal_id` and tell the user:
-> "Lesson plan for L<N> is ready for review. Reply `/approve <proposal_id>` to save it, or `/reject <proposal_id> <feedback>` to request changes."
-
-## Error handling
-
-If `write_file` returns `Rejected`, incorporate the feedback and call `write_file` again. Do NOT retry the same content.
+Handle the `write_file` response per shared instructions ("Writing files"). When narrating, frame it as "lesson plan for L<N> is ready" / "lesson plan for L<N> saved", depending on what the response tells you.

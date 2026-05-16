@@ -12,7 +12,8 @@ Agent topology (§5 of POC_DESIGN.md):
   - SlidesAgent           — adapted, full rewrite in progress (§6.7, §6.8)
 
 Communication: SendMessage only (per user decision, plan §5.1).
-No Handoff flows — Orchestrator stays in the loop for all approval gates.
+No Handoff flows — Orchestrator stays in the loop for every turn, including any
+approval-gate roundtrips when the runtime is `ApprovalGatingBackend`.
 
 Per `.claude/plans/i-want-to-start-stateless-oasis.md` §6.5.
 """

@@ -1,10 +1,11 @@
-"""Tool: generate educator-style slides from HTML fragments and propose via FileOpsBackend.
+"""Tool: generate educator-style slides from HTML fragments and write via FileOpsBackend.
 
 Replaces the themed `BuildPptxFromHtmlSlides` + `ModifySlide` pipeline with a
 simpler flow: the LLM generates HTML body content per slide, this tool wraps
 each in a full HTML document using the course's style.css, calls the existing
-`html2pptx_runner.js` pipeline, then proposes the resulting bytes via the
-`ApprovalGatingBackend`. No sub-agent spawning.
+`html2pptx_runner.js` pipeline, then writes the resulting bytes through the
+active `FileOpsBackend`. The backend decides whether the write lands
+immediately or is gated for user approval. No sub-agent spawning.
 
 Per `.claude/plans/i-want-to-start-stateless-oasis.md` §6.8.
 """
@@ -62,11 +63,10 @@ class GenerateEducatorSlides(BaseTool):
 
     The tool wraps each fragment in a minimal full HTML document using
     `css_content` (the course's style.css), runs `html2pptx_runner.js`
-    (Playwright + dom-to-pptx), and proposes the resulting file via the
-    `ApprovalGatingBackend`. The proposal is NOT committed until the user
-    replies `/approve <proposal_id>`.
-
-    Returns the proposal description including proposal_id, path, and diff.
+    (Playwright + dom-to-pptx), and writes the resulting file through the
+    active `FileOpsBackend`. The response tells you what happened: react to
+    it the same way you would react to `write_file` — see shared instructions
+    "Writing files".
     """
 
     slides_html: list[str] = Field(

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This agency helps educators create course materials: structured slide decks, lesson plans, and research notes, co-created through a diff-approval workflow.
+This agency helps educators create course materials: structured slide decks, lesson plans, and research notes. The educator stays in the loop and directs the work turn-by-turn.
 
 ## File conventions
 
@@ -25,14 +25,16 @@ lessons/
 - Lesson micro-LOs: `LO-N.M` (e.g. `LO-1.1`, `LO-1.2`)
 - Never renumber existing IDs. Gaps are allowed.
 
-## Write proposals
+## Writing files
 
-Every file write goes through user approval. After calling `write_file`:
-1. Read the returned `proposal_id`
-2. Show the user the diff
-3. Ask them to reply `/approve <proposal_id>` or `/reject <proposal_id> <feedback>`
+After calling `write_file` (or any other write tool, e.g. `generate_educator_slides`), read the response. The response tells you what happened — react to it, do not assume an outcome:
 
-If `write_file` returns `Rejected`, revise the content and call `write_file` again. Do NOT retry identical content.
+- **File written.** Tell the user the file is saved and mention the path.
+- **Pending user approval.** The response includes a diff and instructions for the user to follow. Relay the diff and the instructions to the user **verbatim** — do not paraphrase, do not invent your own approval syntax.
+- **Rejected.** The response includes feedback. Incorporate it and call the write tool again with revised content. Never retry identical content.
+- **Failed.** Surface the error to the user and stop; do not retry blindly.
+
+This contract is mode-agnostic: whether the runtime writes immediately or routes through an approval gate, the tool tells you which case you are in.
 
 ## Tone
 

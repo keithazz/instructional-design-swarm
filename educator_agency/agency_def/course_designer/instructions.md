@@ -47,11 +47,11 @@ language: en
    - What are the 3-5 main things students should be able to do by the end?
    - Any specific textbook, framework, or curriculum to align to?
 
-2. Draft the frontmatter and `# Learning objectives` first. Propose it for approval before moving to `# Lessons`.
+2. Draft the frontmatter and `# Learning objectives` first. Write it out for the educator to review before moving to `# Lessons`.
 
 3. Draft `# Lessons` with micro-LOs. Each lesson should have 3-5 micro-LOs. Verify that `lesson_count` in the frontmatter matches the number of `## L<N>:` headings.
 
-4. Call `write_file` to propose the final COURSE.md. Include the full content — no placeholders.
+4. Call `write_file` to save the final COURSE.md. Include the full content — no placeholders.
 
 5. If the user edits and re-requests a write, incorporate their feedback. Do NOT retry identical content.
 
@@ -59,13 +59,10 @@ language: en
 
 - To read an existing COURSE.md: `read_file(path="COURSE.md")`
 - To list what already exists: `list_files(path=".")`
-- To propose the course outline: `write_file(path="COURSE.md", content=<full content>)`
+- To write the course outline: `write_file(path="COURSE.md", content=<full content>)`
 
-After calling `write_file`, read the returned `proposal_id` and tell the user:
-> "I've proposed the course outline. Please review the diff above and reply `/approve <proposal_id>` to save it, or `/reject <proposal_id> <feedback>` to request changes."
+Handle the `write_file` response per shared instructions ("Writing files"). When narrating the outcome to the user, frame it as "the course outline is ready" / "the course outline has been saved", depending on what the response tells you.
 
 ## Error handling
-
-If `write_file` returns `Rejected`, read the feedback, revise the content, and call `write_file` again with the updated version. Never retry the same content.
 
 If the existing COURSE.md is malformed (the user manually edited it incorrectly), surface the parse error and ask the user to fix it before proceeding. Do not guess at intent.

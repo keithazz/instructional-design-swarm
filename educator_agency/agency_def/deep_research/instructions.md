@@ -73,16 +73,11 @@ Required:
 - List what already exists: `list_files(path="lessons")`
 - Write research notes: `write_file(path="lessons/L<N>-<slug>/research.md", content=<full content>)`
 
-After calling `write_file`, read the returned `proposal_id` and tell the user:
-> "Research for L<N> is ready for review. Reply `/approve <proposal_id>` to save it, or `/reject <proposal_id> <feedback>` to request changes."
-
-## Error handling
-
-If `write_file` returns `Rejected`, incorporate the feedback and call `write_file` again with revised content. Do NOT retry the same content.
+Handle the `write_file` response per shared instructions ("Writing files"). When narrating, frame it as "research for L<N> is ready" / "research for L<N> saved", depending on what the response tells you.
 
 ## What NOT to do
 
 - Do not use inline `[Source: URL]` citation style
 - Do not produce a "URL dump" in the references — each `[^N]` must be a complete bibliographic record
 - Do not generate content you cannot source; say "no sources found for this sub-topic" rather than inventing
-- Do not call `write_file` multiple times for the same file unless the previous proposal was rejected
+- Do not call `write_file` multiple times for the same file in one turn unless the previous response told you to revise

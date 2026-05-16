@@ -164,7 +164,7 @@ def main() -> None:
     from educator_agency.agency_def.agency import create_educator_agency
 
     agency = create_educator_agency()
-    agency.tui(show_reasoning=args.show_reasoning, reload=False)
+    agency.tui(show_reasoning=True if args.show_reasoning else None, reload=False)
 
 
 if __name__ == "__main__":

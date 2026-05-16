@@ -16,7 +16,7 @@ def create_educator_deep_research() -> Agent:
         name="DeepResearchAgent",
         description=(
             "Conducts academic research for a single lesson and writes research.md "
-            "to the course directory via the approval gate. Prioritises primary academic "
+            "to the course directory. Prioritises primary academic "
             "sources; uses numbered footnote citations."
         ),
         instructions="./instructions.md",

@@ -8,8 +8,8 @@ def create_educator_orchestrator() -> Agent:
         name="Orchestrator",
         description=(
             "Primary coordinator for the Educator Agency. Routes user requests "
-            "to specialists and mediates file-write approvals. Never produces "
-            "course content directly."
+            "to specialists and stays in the loop while files are being written. "
+            "Never produces course content directly."
         ),
         instructions="./instructions.md",
         tools=[ReadFileTool, ListFilesTool],

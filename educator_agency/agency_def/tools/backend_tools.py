@@ -2,10 +2,12 @@
 
 These are drop-in replacements for `open()`-based file tools. Every agent
 that produces course artifacts (COURSE.md, PLAN.md, research.md, slides.pptx)
-uses these instead of writing files directly, so all writes go through the
-`ApprovalGatingBackend` and surface as diff proposals to the user.
+uses these instead of writing files directly. The runtime decides whether the
+write lands immediately (`LocalFsBackend`) or is gated through diff approval
+(`ApprovalGatingBackend`); the tool surface and the contract the agent reasons
+about are identical in either case.
 
-The backend is retrieved from the process-level context (set by the server at
+The backend is retrieved from the process-level context (set by the runtime at
 startup). All paths are relative to the course root registered with the backend.
 """
 
@@ -35,16 +37,17 @@ class ReadFileTool(BaseTool):
 
 
 class WriteFileTool(BaseTool):
-    """Propose writing a file to the course directory.
+    """Write a file to the course directory.
 
-    The write is NOT committed immediately. It returns a proposal ID and a
-    diff showing what would change. The user must reply with
-    `/approve <proposal_id>` to commit, or `/reject <proposal_id> <feedback>`
-    to decline and give you feedback. Always read back the proposal ID from
-    the response and include it in your message to the user.
+    Returns a response that tells you what actually happened. React to it —
+    do not assume a particular outcome:
 
-    If a previous proposal for this file was rejected, `write_file` again with
-    the revised content. Do NOT retry the same content.
+    - File written: tell the user the file is saved and mention the path.
+    - Pending user approval: the response includes a diff and the exact
+      instructions for the user to follow. Relay both verbatim.
+    - Rejected: read the feedback in the response and call `write_file` again
+      with revised content. Never retry the same content.
+    - Failed: surface the OS error to the user and stop.
     """
 
     path: str = Field(..., description="Path to the file, relative to the course root.")
@@ -77,11 +80,12 @@ class WriteFileTool(BaseTool):
 
 
 class WriteFileBytesTool(BaseTool):
-    """Propose writing a binary file (e.g. slides.pptx) to the course directory.
+    """Write a binary file (e.g. slides.pptx) to the course directory.
 
-    Works like WriteFileTool but accepts a hex-encoded byte string for the
-    content. The diff for binary files is a summary (size comparison), not a
-    textual diff.
+    Same contract as `WriteFileTool` — the response tells you whether the
+    write landed, is pending user approval, was rejected, or failed.
+    Accepts a hex-encoded byte string for the content. For binary files the
+    diff (if any) is a size summary rather than a textual diff.
     """
 
     path: str = Field(..., description="Destination path relative to the course root.")
