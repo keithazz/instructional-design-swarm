@@ -13,6 +13,13 @@ The following files can be read on demand, depending on the task at hand:
 - `.cursor/commands/write-instructions.md` - how to write effective instructions for AI agents
 - `.cursor/commands/create-prd.md` - how to create a PRD for an agent (use for complex multi agent systems)
 
+Within this repository, you are assisting with the creation of an "Instructional Design Agency", that will be integrated with a TUI and eventually, Obsidian. For now, you are primarily concerned with the design of the Agency Swarm, and should refrain from building integrations unless explicitly prompted. This is an architectural bad smell for now, and you should raise it when expected to do so. The following documents are provided only for context: 
+
+- The high level goals of the combined system are outlined in `.claude/instructional-design-swarm/SYSTEM_PRD.md`.
+- The communication architecture is described in `.claude/instructional-design-swarm/ARCHITECTURE.md`
+- The work plan is described in `.claude/instructional-design-swarm/PLAN.md`
+
+
 ## Background
 
 Agency Swarm is an open-source framework designed for orchestrating and managing multiple AI agents, built upon the OpenAI Assistants API. Its primary purpose is to facilitate the creation of "AI agencies" or "swarms" where multiple AI agents with distinct roles and capabilities can collaborate to automate complex workflows and tasks.
