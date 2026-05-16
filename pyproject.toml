@@ -68,3 +68,7 @@ exclude = ["agentswarm-cli*", "venv*", ".venv*", ".agency_swarm*", "node_modules
 
 [tool.setuptools.package-data]
 "*" = ["*.md", "*.json", "agency-*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

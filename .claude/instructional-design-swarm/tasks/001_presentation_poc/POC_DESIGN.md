@@ -1,6 +1,6 @@
 # POC_DESIGN — Educator Agency Phase 1
 
-> Phase 1 vertical-slice design. Pins down the file-format contracts, agent topology, and end-to-end flow for a working POC built as a fork of [VRSEN/OpenSwarm](https://github.com/VRSEN/OpenSwarm). Companion to [PRD.md](./PRD.md), [ARCHITECTURE.md](./ARCHITECTURE.md), and [PLAN.md](./PLAN.md).
+> Phase 1 vertical-slice design. Pins down the file-format contracts, agent topology, and end-to-end flow for a working POC built as a fork of [VRSEN/OpenSwarm](https://github.com/VRSEN/OpenSwarm). Companion to [PRD.md](../../PRD.md), [ARCHITECTURE.md](../../ARCHITECTURE.md), and [PLAN.md](../../PLAN.md).
 
 ## 1. Scope and stance
 
@@ -10,7 +10,7 @@ This document specifies what the POC produces and consumes — the file conventi
 
 **Out of scope for Phase 1.** Obsidian plugin, WebSocket bridge, multi-agent parallelism, prerequisite tagging, active-learning components, per-LLM cost surfacing, multi-language beyond the `language` frontmatter field, hot-reload of agency definitions.
 
-**Inherited from OpenSwarm.** Agency Swarm runtime scaffolding, the HTML-then-PPTX slide generation pipeline (Playwright + LibreOffice), `DeepResearchAgent`, `OrchestratorAgent` topology pattern, onboarding wizard for API keys.
+**Inherited from OpenSwarm.** Agency Swarm runtime scaffolding, the HTML-then-PPTX slide generation pipeline (Playwright rendering HTML and a Node.js `dom-to-pptx` runner — no LibreOffice involved, despite earlier drafts implying otherwise), `DeepResearchAgent`, `OrchestratorAgent` topology pattern, onboarding wizard for API keys.
 
 **Built fresh.** `CourseDesignerAgent`, `LessonPlannerAgent`, the COURSE.md / PLAN.md / PEDAGOGY.md schemas, the LO-numbering convention, the style.css convention, a minimal `FileOpsBackend` wrapper around the file-writing tools.
 
@@ -268,7 +268,7 @@ Visual style spec for generated slide decks. One CSS file at course root, inline
 }
 ```
 
-**Implementation note.** The CSS class names assumed above (`.slide`, `.footnote`, etc.) need to be aligned with whatever the OpenSwarm `slides_agent` actually emits. Phase 1 task: read OpenSwarm's slide HTML output, adapt either the agent's HTML template or this default CSS so they match. Decision deferred to implementation.
+**CSS integration strategy (Phase 1 decision).** The current OpenSwarm `slides_agent` emits HTML using a richer themed system (`.slide`, `.slide-wrapper`, `.content-safe-area`, `.canvas`, `.glass-panel`, `.bg-grid` — and notably **no `.footnote`**), driven by [slides_agent/tools/slide_html_utils.py](../../../../slides_agent/tools/slide_html_utils.py) and [ManageTheme.py](../../../../slides_agent/tools/ManageTheme.py). For educator-agency, we **replace** that themed system with the flat `style.css` above as the only style source. The HTML template is adjusted to emit `.slide`, `.slide h1/h2`, `.footnote`, and `.speaker-notes` blocks; the gradient-to-SVG/theme machinery is bypassed. Re-adding theme variants is a Phase 2+ concern.
 
 ## 4. Learning-objective numbering
 
@@ -323,7 +323,7 @@ Five agents. Three are forked/adapted from OpenSwarm; two are built fresh.
 
 **Outputs.** Proposed `research.md` via the write flow.
 
-**Adaptation from OpenSwarm.** Source-preference instructions adjusted to favour academic / primary sources over commercial web content. Citation format aligned with the footnote convention defined in §3.3.
+**Adaptation from OpenSwarm.** Source-preference instructions adjusted to favour academic / primary sources over commercial web content. Citation format aligned with the footnote convention defined in §3.3 — note this is an **inversion** of the current OpenSwarm prompt, which explicitly forbids the trailing source list and mandates inline `[Source: URL]` markers; expect to verify the rewrite holds under load.
 
 ### LessonPlannerAgent (new)
 
@@ -343,7 +343,7 @@ Five agents. Three are forked/adapted from OpenSwarm; two are built fresh.
 
 **Outputs.** Proposed `slides.pptx` via the write flow.
 
-**Adaptation from OpenSwarm.** Prompt rewritten to consume the structured PLAN.md schema rather than freeform input. HTML template adjusted to honour the class names assumed by style.css (or vice versa — see §3.5 implementation note). Speaker notes generated at ~3-5 sentences per slide. Slide-density tuned for `lesson_duration_minutes`.
+**Adaptation from OpenSwarm.** Prompt rewritten to consume the structured PLAN.md schema rather than freeform input. HTML template adjusted to emit the flat-`style.css` class names (per the §3.5 strategy) instead of the existing themed system. **Speaker notes** generated at ~3-5 sentences per slide and emitted as `<div class="speaker-notes">` blocks in the HTML; a `python-pptx` post-processing pass after `dom-to-pptx` lifts those blocks into PPTX `notesSlide` content (the current OpenSwarm pipeline has no notion of speaker notes — this is net-new work). Slide-density tuned for `lesson_duration_minutes`.
 
 ## 6. End-to-end flows
 
@@ -449,18 +449,18 @@ Explicitly out of scope for Phase 1, with the reason:
 - **Cost / token-usage surfacing.** Out for the POC; a Phase 2 or Phase 3 concern.
 - **Auto-detection of stale lessons after COURSE.md edits.** User explicitly triggers regeneration.
 - **Parallel lesson generation.** Sequential with per-lesson approval (Q2); parallel is a Phase 3 `--batch` mode.
-- **Alignment of style.css class names with OpenSwarm's slide HTML.** Implementation task in Phase 1; design decision deferred until the OpenSwarm output is inspected.
+- **Themed slide system (gradients, glass panels, `ManageTheme.py`).** Phase 1 replaces the existing themed system with the flat `style.css` (per §3.5); re-adding theme variants is a Phase 2+ concern.
 
 ## 8. Implementation notes for the OpenSwarm fork
 
 Things that are not design decisions but matter for the first commits:
 
 - **License.** OpenSwarm is MIT. Fork is clean; preserve the original copyright header in any files retained, add a NOTICE if substantially modified.
-- **Vendoring vs upstream tracking.** Recommend vendoring (copying the agents we reuse into our own tree under our package layout) rather than keeping OpenSwarm as a git remote. The prompts and agent definitions will diverge substantially; cherry-picking upstream improvements is unlikely to pay back. Re-evaluate at Phase 2.
+- **In-place adaptation, not a fresh fork.** This repo *is* the OpenSwarm fork — there is no separate upstream import step. Educator-agency is implemented as a sibling agency definition (`educator_agency/agency_def/agency.py`) that lives alongside the existing [swarm.py](../../../../swarm.py) and imports a subset of the existing agent modules. The other agents (Image, Video, Data Analyst, Virtual Assistant, Docs) stay on disk and stay wired into the original `swarm.py` so the full OpenSwarm agency continues to work — only educator-agency excludes them. Re-evaluate Phase 2 whether to maintain both agencies long-term.
 - **The OpenSwarm prompts assume single-shot.** All four reused agents' instructions will be rewritten. Treat OpenSwarm's prompts as scaffolding, not foundations.
-- **`FileOpsBackend` for Phase 1.** A minimal Python `Protocol` with `read_file`, `write_file`, `list_files`. Single implementation, `LocalFsBackend`, always returns `Accepted` (or `Failed` on OSError). The agent tools call the backend, not `open()` directly. This is the architectural seam that keeps the dual-mode property reachable; building it now is much cheaper than retrofitting later. The full `WriteOutcome` triple (`Accepted` | `Rejected` | `Failed`) is defined per ARCHITECTURE.md §4.2, even though `Rejected` is never produced in Phase 1.
+- **`FileOpsBackend` for Phase 1.** A minimal Python `Protocol` with `read_file`, `write_file`, `list_files`. Two stacked implementations: `LocalFsBackend` (real disk writes; returns `Accepted` or `Failed`) and `ApprovalGatingBackend` (wraps `LocalFsBackend`, stores proposed writes in an `ApprovalBuffer` keyed by `proposal_id`, returns `Pending(proposal_id)` until the user resolves via `/approve` or `/reject`). Agent tools call the backend, not `open()` directly. This is the architectural seam that keeps the dual-mode property reachable. The `WriteOutcome` union is extended from the triple in ARCHITECTURE.md §4.2 to a 4-tuple: `Accepted | Rejected | Failed | Pending(proposal_id)` — the `Pending` variant is needed because the agent's turn completes before the user replies, and the proposal must be addressable across turns. **Architectural impact:** flag this back to ARCHITECTURE.md §4.2; the rejection-handling commitment from §4.3 still holds (agents must reason about `Rejected` even though it only fires when `/reject` is used).
 - **Integration test asserts structure, not exact content.** LLM determinism is not the goal. The Phase 1 integration test: given a fixed prompt and style.css, the system produces a COURSE.md with valid frontmatter, the expected H1 sections, at least 3 lessons with valid LO numbering, at least one `lessons/L<N>-*/` directory populated with all three artifacts, and a `slides.pptx` that opens without error. Content quality is for the user to assess.
-- **Heavy native deps from OpenSwarm.** Playwright/Chromium and LibreOffice ship with the OpenSwarm fork. Acceptable for Phase 1 (single developer, local machine). Will reappear as a distribution problem in Phase 3 (Obsidian plugin bundling) — flag, but don't solve yet.
+- **Heavy native deps from OpenSwarm.** Playwright/Chromium and a Node.js `dom-to-pptx` runner ship with the OpenSwarm fork — *not* LibreOffice, despite an earlier draft of this document claiming otherwise (the slide path is [BuildPptxFromHtmlSlides.py](../../../../slides_agent/tools/BuildPptxFromHtmlSlides.py) → [html2pptx_runner.js](../../../../slides_agent/tools/html2pptx_runner.js)). Acceptable for Phase 1 (single developer, local machine). Will reappear as a distribution problem in Phase 3 (Obsidian plugin bundling) — flag, but don't solve yet.
 
 ## 9. What to build first
 
@@ -469,7 +469,7 @@ Per PLAN.md's "write the integration test first" rule, applied to this design:
 1. **Write the test scaffolding.** Define the integration test that asserts the §6.1 cold-start flow produces a course directory matching this document's schemas. The test will fail until everything below exists.
 2. **Define the file-format parsers.** Small Python modules that read and validate COURSE.md, PLAN.md, research.md against §3's schemas. Tested in isolation. These are the trust boundary between agent output and the rest of the system.
 3. **Define `FileOpsBackend` and `LocalFsBackend`.** Per the §8 implementation notes.
-4. **Fork OpenSwarm.** Vendor the four reused agents into the new package layout. Strip out unused agents (Image, Video, Data Analyst, Virtual Assistant, Docs).
+4. **Define the new agency.** Create `educator_agency/agency_def/agency.py` importing the three reused agents (`OrchestratorAgent`, `DeepResearchAgent`, `SlidesAgent`) and the two new ones. **Keep** the other agents (Image, Video, Data Analyst, Virtual Assistant, Docs) on disk and in [swarm.py](../../../../swarm.py) — they may have future use cases; educator-agency simply doesn't import them.
 5. **Rewrite the agent prompts.** Per §5 commitments, against the schemas in §3 and §4.
 6. **Build `CourseDesignerAgent` and `LessonPlannerAgent`.** New code.
 7. **Wire orchestrator handoffs.** Per §6.1.
