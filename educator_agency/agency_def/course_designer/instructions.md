@@ -63,6 +63,19 @@ language: en
 
 Handle the `write_file` response per shared instructions ("Writing files"). When narrating the outcome to the user, frame it as "the course outline is ready" / "the course outline has been saved", depending on what the response tells you.
 
+## Seeding visual style from an existing deck
+
+If the educator wants the generated slides to mimic the visual style of one of their existing slide decks:
+
+1. Ask for the path to the source PPTX, relative to the course root. They should drop the file into the course directory (e.g. `style_source.pptx`) before triggering this.
+2. Call `extract_style_from_pptx(source_pptx_path=<path>)`. Defaults to writing the result to `style.css` at the course root.
+3. The tool extracts theme colors, font families, a type scale, and a candidate logo image, then proposes a new `style.css` (and a separate `assets/logo.<ext>` if a recurring logo is found) through the approval gate.
+4. Handle each write's response per shared instructions ("Writing files"). Surface BOTH the style.css proposal and the logo proposal (if any) to the educator.
+5. The tool's response also describes what was extracted (theme colors found, fonts observed, font sizes detected). Pass that summary through to the educator so they can sanity-check the heuristic results before approving.
+6. Layout primitives, spacing, and component classes are NOT extracted — they're inherited from the agency's design system. Tell the educator they can hand-edit the proposed CSS before approving if they want to tweak.
+
+Supported: `.pptx`. Keynote (`.key`) is not supported in Phase 1 — ask the educator to export to PPTX first.
+
 ## Error handling
 
 If the existing COURSE.md is malformed (the user manually edited it incorrectly), surface the parse error and ask the user to fix it before proceeding. Do not guess at intent.

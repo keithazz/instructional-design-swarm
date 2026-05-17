@@ -185,3 +185,5 @@ cython_debug/
 third_party/
 
 courses/
+
+.slides_debug/

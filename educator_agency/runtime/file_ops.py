@@ -57,6 +57,8 @@ class FileOpsBackend(Protocol):
 
     def read_file(self, path: Path) -> str: ...
 
+    def read_bytes(self, path: Path) -> bytes: ...
+
     def write_file(self, path: Path, content: str | bytes) -> WriteOutcome: ...
 
     def list_files(self, path: Path) -> list[Path]: ...
@@ -82,6 +84,10 @@ class LocalFsBackend:
     def read_file(self, path: Path) -> str:
         resolved = self._resolve(path)
         return resolved.read_text(encoding="utf-8")
+
+    def read_bytes(self, path: Path) -> bytes:
+        resolved = self._resolve(path)
+        return resolved.read_bytes()
 
     def write_file(self, path: Path, content: str | bytes) -> WriteOutcome:
         try:
@@ -176,6 +182,9 @@ class ApprovalGatingBackend:
     def read_file(self, path: Path) -> str:
         return self.inner.read_file(path)
 
+    def read_bytes(self, path: Path) -> bytes:
+        return self.inner.read_bytes(path)
+
     def list_files(self, path: Path) -> list[Path]:
         return self.inner.list_files(path)
 
@@ -251,6 +260,9 @@ class ChaosBackend:
 
     def read_file(self, path: Path) -> str:
         return self.inner.read_file(path)
+
+    def read_bytes(self, path: Path) -> bytes:
+        return self.inner.read_bytes(path)
 
     def list_files(self, path: Path) -> list[Path]:
         return self.inner.list_files(path)
