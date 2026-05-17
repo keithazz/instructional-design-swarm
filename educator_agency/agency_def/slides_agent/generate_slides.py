@@ -16,6 +16,7 @@ Architectural anchors:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -131,11 +132,11 @@ _HTML_TEMPLATE = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=1280, height=720">
+{font_links}
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 html, body {{ width: 1280px; height: 720px; overflow: hidden; }}
 {css}
-.speaker-notes {{ display: none; }}
 </style>
 </head>
 <body>
@@ -145,6 +146,516 @@ html, body {{ width: 1280px; height: 720px; overflow: hidden; }}
 </body>
 </html>
 """
+
+
+_GOOGLE_FONTS_IMPORT_RE = re.compile(
+    r'@import\s+url\(\s*["\']?(https?://fonts\.googleapis\.com/[^"\')\s]+)["\']?\s*\)\s*;?',
+    re.IGNORECASE,
+)
+
+# Image-related extensions the preprocessing helpers recognise.
+# Mirrors slides_agent/tools/ModifySlide.py:166-170 so behaviour is consistent.
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif"}
+
+
+def _is_image_path(src: str) -> bool:
+    return Path(src.split("?")[0]).suffix.lower() in _IMAGE_EXTENSIONS
+
+
+def _convert_css_bg_images_to_img_tags(html: str) -> str:
+    """Convert CSS background-image url(...) to <img> tags.
+
+    Ported from slides_agent/tools/ModifySlide.py:62-163. dom-to-pptx walks
+    DOM nodes; CSS background paints aren't DOM nodes and silently disappear
+    in the PPTX. Replacing them with an absolutely-positioned <img> as the
+    element's first child preserves the visual.
+
+    Handles two patterns:
+      1. Inline style:  <div style="background-image: url(img.png)">
+      2. Class-based:   .cls { background-image: url(img.png) } + <div class="cls">
+
+    Leaves remote URLs (http://, https://, file://) and non-image data: URIs
+    untouched. CSS gradients (linear-gradient, radial-gradient) are left
+    untouched too — the runner rasterises those separately.
+    """
+    _BG_STRIP_RE = re.compile(
+        r'\bbackground-image\s*:\s*url\([^)]*\)\s*;?\s*'
+        r'|\bbackground-size\s*:\s*[^;]+;\s*'
+        r'|\bbackground-position\s*:\s*[^;]+;\s*'
+        r'|\bbackground-repeat\s*:\s*[^;]+;\s*',
+        re.IGNORECASE,
+    )
+
+    def _img_tag(src: str) -> str:
+        return (
+            f'<img src="{src}" alt="" '
+            f'style="position:absolute;top:0;left:0;width:100%;height:100%;'
+            f'object-fit:cover;z-index:0;" />'
+        )
+
+    def _should_convert(url_arg: str) -> bool:
+        if url_arg.startswith("data:image/"):
+            return True
+        if url_arg.startswith(("data:", "http://", "https://", "file://")):
+            return False
+        return _is_image_path(url_arg)
+
+    # 1. Inline style="...background-image: url(...)..."
+    inline_re = re.compile(
+        r'(<[a-zA-Z][^>]*?style=["\'])([^"\']*?background-image\s*:\s*url\(([^)]+)\)[^"\']*?)(["\'][^>]*>)',
+        re.IGNORECASE,
+    )
+
+    def rewrite_inline(m: re.Match) -> str:
+        before, style_val, url_raw, after = m.group(1), m.group(2), m.group(3), m.group(4)
+        url_arg = url_raw.strip("\"' ")
+        if not _should_convert(url_arg):
+            return m.group(0)
+        clean = _BG_STRIP_RE.sub('', style_val).strip().rstrip(';')
+        return f'{before}{clean}{after}{_img_tag(url_arg)}'
+
+    html = inline_re.sub(rewrite_inline, html)
+
+    # 2. Class-based rules in <style> blocks.
+    style_block_re = re.compile(r'<style[^>]*>(.*?)</style>', re.IGNORECASE | re.DOTALL)
+    css_class_bg_re = re.compile(
+        r'\.([a-zA-Z_-][\w-]*)\s*\{([^}]*?background-image\s*:\s*url\(([^)]+)\)[^}]*?)\}',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    class_to_url: dict[str, str] = {}
+    for style_m in style_block_re.finditer(html):
+        for rule_m in css_class_bg_re.finditer(style_m.group(1)):
+            cls = rule_m.group(1)
+            url_arg = rule_m.group(3).strip("\"' ")
+            if _should_convert(url_arg):
+                class_to_url[cls] = url_arg
+
+    if not class_to_url:
+        return html
+
+    def rewrite_style_block(style_m: re.Match) -> str:
+        css = style_m.group(1)
+
+        def clean_rule(rule_m: re.Match) -> str:
+            cls = rule_m.group(1)
+            if cls not in class_to_url:
+                return rule_m.group(0)
+            cleaned_body = _BG_STRIP_RE.sub('', rule_m.group(2)).strip().rstrip(';')
+            return f'.{cls} {{{cleaned_body}}}'
+
+        return f'<style>{css_class_bg_re.sub(clean_rule, css)}</style>'
+
+    html = style_block_re.sub(rewrite_style_block, html)
+
+    class_pattern = '|'.join(re.escape(c) for c in class_to_url)
+    element_re = re.compile(
+        rf'(<[a-zA-Z][^>]*?class=["\'][^"\']*?(?:{class_pattern})[^"\']*?["\'][^>]*>)',
+        re.IGNORECASE,
+    )
+
+    def inject_img(m: re.Match) -> str:
+        opening = m.group(1)
+        classes = re.search(r'class=["\']([^"\']+)["\']', opening, re.IGNORECASE)
+        if not classes:
+            return opening
+        for cls in classes.group(1).split():
+            if cls in class_to_url:
+                return f'{opening}{_img_tag(class_to_url[cls])}'
+        return opening
+
+    html = element_re.sub(inject_img, html)
+    return html
+
+
+def _embed_local_images_as_base64(html: str, project_dir: Path) -> str:
+    """Replace local image references with base64 data URIs.
+
+    Ported from slides_agent/tools/ModifySlide.py:173-219. Encoding inline
+    avoids any reliance on the runner's relative-path resolution and removes
+    a class of silent failures where the renderer cannot find an asset.
+
+    Handles HTML src=, CSS url(), SVG href/xlink:href, and <object data=>.
+    Only processes paths with known image file extensions to avoid
+    accidentally encoding scripts, stylesheets, or fonts.
+    """
+    import base64
+    import mimetypes
+
+    def _encode(src: str) -> str | None:
+        if (
+            src.startswith("data:")
+            or src.startswith("http://")
+            or src.startswith("https://")
+            or src.startswith("file://")
+            or not _is_image_path(src)
+        ):
+            return None
+        img_path = (project_dir / src).resolve()
+        if not img_path.exists():
+            return None
+        mime, _ = mimetypes.guess_type(str(img_path))
+        mime = mime or "image/png"
+        encoded = base64.b64encode(img_path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    def replace_src(match: re.Match) -> str:
+        quote, src = match.group(1), match.group(2)
+        data_uri = _encode(src)
+        return f"src={quote}{data_uri}{quote}" if data_uri else match.group(0)
+
+    def replace_css_url(match: re.Match) -> str:
+        quote, src = match.group(1), match.group(2)
+        data_uri = _encode(src)
+        return f"url({quote}{data_uri}{quote})" if data_uri else match.group(0)
+
+    def replace_href(match: re.Match) -> str:
+        attr, quote, src = match.group(1), match.group(2), match.group(3)
+        data_uri = _encode(src)
+        return f'{attr}={quote}{data_uri}{quote}' if data_uri else match.group(0)
+
+    html = re.sub(r'src=(["\'])((?!data:|https?://|file://)[^"\']+)\1', replace_src, html)
+    html = re.sub(r'url\((["\']?)((?!data:|https?://|file://)[^"\')\s]+)\1\)', replace_css_url, html)
+    html = re.sub(
+        r'(href|xlink:href|data)=(["\'])((?!data:|https?://|file://|#)[^"\']+)\2',
+        replace_href,
+        html,
+    )
+    return html
+
+
+def _strip_base64_images(html: str) -> str:
+    """Replace base64 data URI image references with short placeholders.
+
+    Ported from slides_agent/tools/ModifySlide.py:48-59. Used when feeding
+    a previous-attempt HTML back to the sub-agent on a retry, so the LLM
+    sees structural context without spending tokens on multi-MB base64 blobs.
+    """
+    html = re.sub(r'src=(["\'])data:image/[^"\']+\1', r'src=\1[image]\1', html)
+    html = re.sub(r'url\((["\']?)data:image/[^"\')\s]+\1\)', r'url(\1[image]\1)', html)
+    html = re.sub(r'(href|xlink:href|data)=(["\'])data:image/[^"\']+\2', r'\1=\2[image]\2', html)
+    return html
+
+
+_VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def _collect_local_image_refs(html: str) -> list[str]:
+    """Find local-looking image refs (img src / url()) in HTML."""
+    refs: list[str] = []
+    for m in re.finditer(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE):
+        refs.append(m.group(1).strip())
+    for m in re.finditer(r'url\s*\(\s*["\']?([^"\')\s]+)["\']?\s*\)', html, re.IGNORECASE):
+        refs.append(m.group(1).strip())
+    local: list[str] = []
+    for ref in refs:
+        low = ref.lower()
+        if low.startswith(("http://", "https://", "data:")):
+            continue
+        local.append(ref)
+    return local
+
+
+def _validate_image_refs(course_root: Path, html: str) -> list[str]:
+    """Verify every local image ref exists under course_root and is a real image."""
+    errors: list[str] = []
+    course_root = course_root.resolve()
+    seen: set[str] = set()
+    for ref in _collect_local_image_refs(html):
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        normalized = ref.lstrip("/").replace("\\", "/")
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        full = (course_root / normalized).resolve()
+        try:
+            full.relative_to(course_root)
+        except (ValueError, TypeError):
+            errors.append(f"Image path escapes course root: {ref}")
+            continue
+        if not full.exists():
+            errors.append(f"Image file not found: {ref} (resolved to {full})")
+            continue
+        if full.suffix.lower() not in _VALID_IMAGE_EXTENSIONS:
+            errors.append(
+                f"Image '{ref}' has unsupported extension '{full.suffix}'. "
+                f"Use one of: {', '.join(sorted(_VALID_IMAGE_EXTENSIONS))}"
+            )
+            continue
+        try:
+            with open(full, "rb") as f:
+                header = f.read(50)
+            if header.startswith(b"<") or b"<html" in header.lower():
+                errors.append(
+                    f"Image '{ref}' is not a valid image file (looks like HTML)."
+                )
+        except OSError:
+            pass
+    return errors
+
+
+# Inline-badge regex: matches a <p>/<li> that contains plain text followed by
+# a styled-background span/code/a — these split PPTX text boxes. Mirrors
+# slides_agent/tools/slide_html_utils.py:181-192.
+_INLINE_BADGE_IN_TEXT = re.compile(
+    r'<(?:p|li)[^>]*>[^<]+<(?:span|code|a)[^>]+style=["\'][^"\']*background[^"\']*["\'][^>]*>[^<]+</(?:span|code|a)>',
+    re.IGNORECASE | re.DOTALL,
+)
+_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF]")
+_EMPTY_DOT_RE = re.compile(
+    r'<span[^>]*class=["\'][^"\']*\bdot\b[^"\']*["\'][^>]*>\s*</span>',
+    re.IGNORECASE,
+)
+
+
+def _validate_slide(wrapped_html: str, course_root: Path) -> dict:
+    """Run sync-Playwright validation on a fully-wrapped slide HTML.
+
+    Ported from slides_agent/tools/slide_html_utils.py:163-339 (validate_html).
+    Returns {"valid": bool, "error": str}.
+
+    Checks:
+      - Local image refs exist and are valid image files.
+      - No emoji / Unicode pictographs (don't render reliably in PPTX).
+      - No empty <span class="dot"></span> (invisible bullet markers).
+      - No styled badges/pills inline within flowing <p>/<li> text
+        (fragments PPTX text boxes).
+      - Body dimensions match 1280x720 within 2px tolerance.
+      - No horizontal/vertical content overflow.
+      - No text within 3px of the bottom edge (descender clipping).
+      - No naked text nodes inside <div> (dom-to-pptx mishandles them).
+
+    Designed to be called via `asyncio.to_thread(...)` from the async tool
+    `run()` so the sync Playwright API doesn't block the event loop.
+    """
+    errors: list[str] = []
+    errors.extend(_validate_image_refs(course_root, wrapped_html))
+
+    if _EMOJI_RE.search(wrapped_html):
+        errors.append(
+            "Emoji/Unicode symbols detected. Use inline SVG or image icons instead."
+        )
+    if _EMPTY_DOT_RE.search(wrapped_html):
+        errors.append(
+            "Empty <span class='dot'></span> bullets detected. Replace with "
+            "inline SVG circles or image assets — empty spans render blank in PPTX."
+        )
+    if _INLINE_BADGE_IN_TEXT.search(wrapped_html):
+        errors.append(
+            "Styled badge/pill detected inline within <p> or <li> text. "
+            "Inline elements with background-color split the surrounding sentence "
+            "into separate PPTX text boxes. Move the badge to its own line / container."
+        )
+
+    # Write to a tempfile under the course root so relative ./assets/ paths
+    # in the slide HTML resolve against the right base.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".html",
+        delete=False,
+        encoding="utf-8",
+        dir=str(course_root),
+    ) as f:
+        f.write(wrapped_html)
+        temp_path = f.name
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.goto(f"file://{temp_path}", wait_until="load")
+
+            dims = page.evaluate(
+                """() => {
+                    const body = document.body;
+                    const slide = document.querySelector('.slide') || body;
+                    const style = window.getComputedStyle(body);
+                    return {
+                        width: parseFloat(style.width),
+                        height: parseFloat(style.height),
+                        scrollWidth: Math.max(body.scrollWidth, slide.scrollWidth),
+                        scrollHeight: Math.max(body.scrollHeight, slide.scrollHeight),
+                    };
+                }"""
+            )
+
+            if abs(dims["width"] - 1280) > 2:
+                errors.append(f"Body width must be 1280px, got {dims['width']:.0f}px.")
+            if abs(dims["height"] - 720) > 2:
+                errors.append(f"Body height must be 720px, got {dims['height']:.0f}px.")
+
+            w_over = max(0, dims["scrollWidth"] - dims["width"] - 1)
+            h_over = max(0, dims["scrollHeight"] - dims["height"] - 1)
+            if w_over > 0:
+                errors.append(
+                    f"Content overflows horizontally by {w_over:.0f}px. "
+                    "Reduce content width, font size, or padding."
+                )
+            if h_over > 0:
+                errors.append(
+                    f"Content overflows vertically by {h_over:.0f}px. "
+                    "Reduce content height, font size, or move elements up from the bottom."
+                )
+
+            descender_issues = page.evaluate(
+                """() => {
+                    const body = document.body;
+                    const bodyRect = body.getBoundingClientRect();
+                    const els = Array.from(body.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, span'));
+                    const issues = [];
+                    for (const el of els) {
+                        const r = el.getBoundingClientRect();
+                        const dist = bodyRect.bottom - r.bottom;
+                        if (dist >= -1 && dist < 3 && el.textContent.trim()) {
+                            issues.push({ text: el.textContent.trim().substring(0, 30), dist });
+                        }
+                    }
+                    return issues;
+                }"""
+            )
+            if descender_issues:
+                for issue in descender_issues[:2]:
+                    errors.append(
+                        f"Text '{issue['text']}…' is too close to the bottom edge "
+                        f"({issue['dist']:.1f}px). Move it up at least 5-10px to avoid descender clipping."
+                    )
+
+            if w_over > 0 or h_over > 0:
+                offenders = page.evaluate(
+                    """() => {
+                        const body = document.body;
+                        const br = body.getBoundingClientRect();
+                        const out = [];
+                        for (const el of body.querySelectorAll('*')) {
+                            const r = el.getBoundingClientRect();
+                            const right = Math.max(0, r.right - br.right);
+                            const bottom = Math.max(0, r.bottom - br.bottom);
+                            const left = Math.max(0, br.left - r.left);
+                            const top = Math.max(0, br.top - r.top);
+                            if (right || bottom || left || top) {
+                                out.push({
+                                    tag: el.tagName.toLowerCase(),
+                                    id: el.id || '',
+                                    className: el.className || '',
+                                    right, bottom, left, top,
+                                    area: Math.max(0, r.width) * Math.max(0, r.height),
+                                });
+                            }
+                        }
+                        out.sort((a, b) => b.area - a.area);
+                        return out.slice(0, 3);
+                    }"""
+                )
+                if offenders:
+                    errors.append("Top overflow offenders:")
+                    for off in offenders:
+                        ident = off["tag"]
+                        if off["id"]:
+                            ident += f"#{off['id']}"
+                        if off["className"]:
+                            ident += "." + str(off["className"]).strip().replace(" ", ".")
+                        errors.append(
+                            f"  - {ident} (R:{off['right']:.0f}px, B:{off['bottom']:.0f}px, "
+                            f"L:{off['left']:.0f}px, T:{off['top']:.0f}px)"
+                        )
+
+            unwrapped = page.evaluate(
+                """() => {
+                    const issues = [];
+                    // Skip elements that are hidden (display:none or visibility:hidden)
+                    // since dom-to-pptx never sees them — most notably the
+                    // .speaker-notes div, whose text is harvested separately for
+                    // the PPTX notesSlide.
+                    const isHidden = (el) => {
+                        for (let cur = el; cur && cur !== document.body.parentElement; cur = cur.parentElement) {
+                            const s = window.getComputedStyle(cur);
+                            if (s.display === 'none' || s.visibility === 'hidden') return true;
+                        }
+                        return false;
+                    };
+                    document.querySelectorAll('div').forEach(div => {
+                        if (isHidden(div)) return;
+                        for (const n of div.childNodes) {
+                            if (n.nodeType === Node.TEXT_NODE && n.textContent.trim()) {
+                                const t = n.textContent.trim().substring(0, 50);
+                                issues.push(t + (n.textContent.trim().length > 50 ? '…' : ''));
+                            }
+                        }
+                    });
+                    return issues;
+                }"""
+            )
+            if unwrapped:
+                errors.append("Naked text inside <div> (must be wrapped in <p>/<h*>/<li>):")
+                for t in unwrapped[:3]:
+                    errors.append(f"  - '{t}'")
+
+            browser.close()
+    except Exception as exc:
+        errors.append(f"Validation error: {exc}")
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    if errors:
+        return {"valid": False, "error": "\n".join(errors)}
+    return {"valid": True, "error": ""}
+
+
+def _backend_root() -> Path:
+    """Resolve the backend's filesystem root (the course root).
+
+    Duck-types `.root` (LocalFsBackend) and `.inner.root` (gating wrappers).
+    Falls back to Path.cwd() so the helper never raises; the validation
+    pass will simply skip image-existence checks for the wrong root.
+    """
+    backend = get_backend()
+    root = getattr(backend, "root", None)
+    if root is None:
+        inner = getattr(backend, "inner", None)
+        root = getattr(inner, "root", None)
+    if root is None:
+        logger.warning("Backend has no .root attribute; falling back to CWD for image preprocessing.")
+        return Path.cwd()
+    return Path(root)
+
+
+def _extract_google_fonts_links(css_content: str) -> str:
+    """Promote any @import url('...fonts.googleapis.com...') rules in the
+    course CSS to explicit <link rel="stylesheet"> tags.
+
+    The Node runner's font pre-download (html2pptx_runner.js:collectGoogleFontsHrefs)
+    inspects HTML <link> tags only — it does NOT parse @import rules inside
+    <style> blocks. Without this promotion, Google Fonts are fetched by
+    Chromium at render time as WOFF2 and PowerPoint's WOFF2 embedding is
+    unreliable, so the deck falls back to system fonts.
+
+    Returns a string of <link> tags (one per unique href, in source order).
+    Includes a <link rel="preconnect"> to fonts.gstatic.com for parity with
+    the standard Google Fonts boilerplate.
+    """
+    hrefs: list[str] = []
+    seen: set[str] = set()
+    for match in _GOOGLE_FONTS_IMPORT_RE.finditer(css_content):
+        href = match.group(1).strip()
+        if href in seen:
+            continue
+        seen.add(href)
+        hrefs.append(href)
+    if not hrefs:
+        return ""
+    parts = [
+        '<link rel="preconnect" href="https://fonts.googleapis.com">',
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>',
+    ]
+    for href in hrefs:
+        parts.append(f'<link rel="stylesheet" href="{href}">')
+    return "\n".join(parts)
 
 
 class SlideBrief(BaseModel):
@@ -195,8 +706,13 @@ class SlideBrief(BaseModel):
     speaker_notes: str = Field(
         ...,
         description=(
-            "3-5 sentences of the lecturer's script. Embedded in the PPTX "
-            "notesSlide (not visible on the slide itself)."
+            "3-5 sentences of the lecturer's script. Captured in debug "
+            "artifacts (.slides_debug/<ts>/slide_NNN_brief.json) for future "
+            "use; NOT currently embedded in the PPTX. The previous "
+            "python-pptx round-trip that embedded these was dropping "
+            "embedded fonts and shape styling from the runner's output, so "
+            "the pass was removed. Keep populating this field — when a "
+            "non-lossy embed mechanism lands the data will be ready."
         ),
     )
 
@@ -298,8 +814,18 @@ def _build_writer_prompt(
     css_content: str,
     slide_index: int,
     total_slides: int,
+    *,
+    prev_error: str = "",
+    prev_html: str | None = None,
 ) -> str:
-    """Compose the per-slide prompt for the HTML-writer sub-agent."""
+    """Compose the per-slide prompt for the HTML-writer sub-agent.
+
+    On retry attempts, `prev_error` (validation feedback) and `prev_html`
+    (the failed attempt, base64-image-stripped to save tokens) are
+    appended so the sub-agent can do a surgical fix instead of starting
+    from scratch. Mirrors the structure of slides_agent/tools/ModifySlide.py
+    `_build_sub_run_prompt` retry block.
+    """
     parts = [
         f"You are generating slide {slide_index} of {total_slides} for a lecture deck.",
         "",
@@ -323,9 +849,34 @@ def _build_writer_prompt(
         parts.append("Citations to surface on this slide:")
         for c in brief.citations:
             parts.append(f"  - {c}")
+    parts.append("=== END BRIEF ===")
+
+    if prev_error or prev_html:
+        parts.extend(
+            [
+                "",
+                "=== VALIDATION_FEEDBACK_FROM_PREVIOUS_ATTEMPT ===",
+                prev_error.strip() or "(no error text — sub-agent returned nothing)",
+                "=== END VALIDATION_FEEDBACK ===",
+            ]
+        )
+        if prev_html:
+            parts.extend(
+                [
+                    "",
+                    "=== PREVIOUS_ATTEMPT (your last HTML; fix the issues above) ===",
+                    prev_html.strip(),
+                    "=== END PREVIOUS_ATTEMPT ===",
+                ]
+            )
+        parts.append(
+            "Make the smallest correction that addresses every issue above. "
+            "Do NOT rewrite the slide from scratch unless the previous attempt "
+            "was empty or fundamentally broken."
+        )
+
     parts.extend(
         [
-            "=== END BRIEF ===",
             "",
             "Return ONLY the HTML body fragment for this slide (the content inside "
             "<div class=\"slide\">…</div>). No markdown fences, no commentary, no "
@@ -433,6 +984,10 @@ class GenerateEducatorSlides(BaseTool):
         description="Presentation layout. Default LAYOUT_16x9_1280 (1280x720).",
     )
 
+    # Per-slide attempt cap: initial + 1 retry. Bounds LLM cost when the
+    # validation pass keeps rejecting the sub-agent's output.
+    _MAX_ATTEMPTS = 2
+
     async def run(self) -> str:
         if not self.slides:
             logger.warning("GenerateEducatorSlides called with empty slides list.")
@@ -450,14 +1005,21 @@ class GenerateEducatorSlides(BaseTool):
 
         total = len(self.slides)
         run_dir = _make_run_artifact_dir()
+        course_root = _backend_root()
+        font_links = _extract_google_fonts_links(self.css_content)
         logger.info(
             "GenerateEducatorSlides: %d slides → %s (layout=%s); artifacts: %s",
             total, self.output_path, self.layout, run_dir or "(disabled)",
         )
-        logger.debug("css_content: %d chars", len(self.css_content))
+        logger.debug("css_content: %d chars; course_root: %s", len(self.css_content), course_root)
+        if font_links:
+            n_links = font_links.count('rel="stylesheet"')
+            logger.info("promoted %d @import Google Fonts URL(s) to <link> tag(s)", n_links)
+        else:
+            logger.debug("no @import Google Fonts URLs found in css_content")
 
         writer, is_codex = _make_html_writer_agent()
-        html_bodies: list[str] = []
+        wrapped_htmls: list[str] = []
         failures: list[str] = []
 
         for i, brief in enumerate(self.slides, start=1):
@@ -466,69 +1028,39 @@ class GenerateEducatorSlides(BaseTool):
                 i, total, brief.layout, brief.title,
                 len(brief.key_points), "yes" if brief.code else "no",
             )
-            prompt = _build_writer_prompt(brief, self.css_content, i, total)
-            logger.debug("slide %d prompt: %d chars", i, len(prompt))
-            _dump(run_dir, i, "prompt.txt", prompt)
             _dump(run_dir, i, "brief.json", brief.model_dump_json(indent=2))
 
-            try:
-                result = await _agent_get_response(writer, prompt, use_stream=is_codex)
-            except Exception as exc:
-                logger.exception("slide %d sub-agent raised: %s", i, exc)
-                failures.append(f"slide {i} ({brief.title}): sub-agent error: {exc}")
-                html_bodies.append(_fallback_html(brief))
-                _dump(run_dir, i, "FAILURE.txt", f"sub-agent raised: {exc}")
-                continue
-
-            if result is None:
-                logger.warning("slide %d: sub-agent returned None (likely API/rate-limit)", i)
-                failures.append(f"slide {i} ({brief.title}): sub-agent returned None")
-                html_bodies.append(_fallback_html(brief))
-                _dump(run_dir, i, "FAILURE.txt", "sub-agent returned None")
-                continue
-
-            output_text = str(getattr(result, "final_output", "") or "")
-            logger.debug(
-                "slide %d raw output: %d chars\n%s",
-                i, len(output_text), _truncate(output_text),
+            wrapped, error_text = await self._generate_one_slide(
+                brief=brief,
+                slide_index=i,
+                total=total,
+                writer=writer,
+                is_codex=is_codex,
+                font_links=font_links,
+                course_root=course_root,
+                run_dir=run_dir,
             )
-            _dump(run_dir, i, "raw_response.txt", output_text)
-
-            fragment, extraction_steps = _extract_html_fragment(output_text)
-            for step in extraction_steps:
-                logger.debug("slide %d extract: %s", i, step)
-
-            if not fragment:
+            if wrapped is None:
+                failures.append(f"slide {i} ({brief.title}): {error_text}")
                 logger.warning(
-                    "slide %d: extraction produced empty fragment — falling back. "
-                    "raw output starts with: %r",
-                    i, output_text[:200],
+                    "slide %d: all %d attempts failed; falling back to plain bullets",
+                    i, self._MAX_ATTEMPTS,
                 )
-                failures.append(f"slide {i} ({brief.title}): empty sub-agent output")
-                html_bodies.append(_fallback_html(brief))
-                _dump(run_dir, i, "FAILURE.txt", "extraction produced empty fragment")
-                continue
-
-            logger.info("slide %d ok: %d chars of HTML", i, len(fragment))
-            _dump(run_dir, i, "fragment.html", fragment)
-            html_bodies.append(fragment)
+                fallback_body = _fallback_html(brief)
+                wrapped = self._wrap_full_html(fallback_body, brief, font_links)
+                _dump(run_dir, i, "FALLBACK_wrapped.html", wrapped)
+            wrapped_htmls.append(wrapped)
 
         successes = total - len(failures)
         logger.info(
             "sub-agent loop done: %d ok, %d fell back to plain bullets",
             successes, len(failures),
         )
-        if failures:
-            failure_note = "\n".join(f"  - {f}" for f in failures)
-        else:
-            failure_note = ""
+        failure_note = "\n".join(f"  - {f}" for f in failures) if failures else ""
 
         with tempfile.TemporaryDirectory(prefix="educator_slides_") as tmp:
             tmp_path = Path(tmp)
-            html_files = self._write_html_files(tmp_path, html_bodies)
-            # Snapshot the final per-slide HTML (post-wrapping) for inspection.
-            for idx, html_file in enumerate(html_files, start=1):
-                _dump(run_dir, idx, "final_wrapped.html", Path(html_file).read_text(encoding="utf-8"))
+            html_files = self._write_wrapped_to_tmp(tmp_path, wrapped_htmls)
             pptx_path = tmp_path / "slides.pptx"
             logger.debug("running html2pptx_runner.js on %d files", len(html_files))
             error = self._run_converter(html_files, pptx_path)
@@ -541,7 +1073,15 @@ class GenerateEducatorSlides(BaseTool):
                 logger.exception("could not read generated PPTX")
                 return f"Failed to read generated PPTX: {exc}"
             logger.debug("PPTX generated: %d bytes", len(pptx_bytes))
-            pptx_bytes = self._add_speaker_notes(pptx_bytes)
+
+        # Diagnostic dump: with no post-processing this should be byte-equal
+        # to the final written PPTX. If they ever diverge after a future
+        # change, that's the signal to investigate.
+        if run_dir is not None:
+            try:
+                (run_dir / "slides_pre_postprocess.pptx").write_bytes(pptx_bytes)
+            except OSError as exc:
+                logger.debug("Could not dump slides_pre_postprocess.pptx: %s", exc)
 
         backend = get_backend()
         outcome = backend.write_file(Path(self.output_path), pptx_bytes)
@@ -572,15 +1112,163 @@ class GenerateEducatorSlides(BaseTool):
             )
         return msg
 
-    def _write_html_files(self, tmp_path: Path, html_bodies: list[str]) -> list[str]:
-        paths = []
-        for i, (brief, body) in enumerate(zip(self.slides, html_bodies)):
-            full_body = body
-            if brief.speaker_notes.strip():
-                # Escape only </div> sequences that would close the wrapper early.
-                notes = brief.speaker_notes.strip().replace("</div>", "&lt;/div&gt;")
-                full_body = f'{body}\n<div class="speaker-notes">{notes}</div>'
-            html = _HTML_TEMPLATE.format(css=self.css_content, body=full_body)
+    async def _generate_one_slide(
+        self,
+        *,
+        brief: SlideBrief,
+        slide_index: int,
+        total: int,
+        writer: Agent,
+        is_codex: bool,
+        font_links: str,
+        course_root: Path,
+        run_dir: Path | None,
+    ) -> tuple[str | None, str]:
+        """Run the up-to-MAX_ATTEMPTS sub-agent / preprocess / validate loop
+        for one slide. Returns (wrapped_html, "") on success, or (None, reason)
+        if all attempts were rejected by validation or the sub-agent failed.
+        """
+        last_error = ""
+        last_fragment_stripped: str | None = None
+
+        for attempt in range(1, self._MAX_ATTEMPTS + 1):
+            tag = f"attempt_{attempt}"
+            logger.debug(
+                "slide %d attempt %d/%d: building prompt (prev_error=%s)",
+                slide_index, attempt, self._MAX_ATTEMPTS,
+                "yes" if last_error else "no",
+            )
+
+            prompt = _build_writer_prompt(
+                brief, self.css_content, slide_index, total,
+                prev_error=last_error,
+                prev_html=last_fragment_stripped,
+            )
+            _dump(run_dir, slide_index, f"{tag}_prompt.txt", prompt)
+            logger.debug("slide %d %s prompt: %d chars", slide_index, tag, len(prompt))
+
+            try:
+                result = await _agent_get_response(writer, prompt, use_stream=is_codex)
+            except Exception as exc:
+                logger.exception(
+                    "slide %d %s: sub-agent raised: %s", slide_index, tag, exc
+                )
+                last_error = f"sub-agent raised: {exc}"
+                _dump(run_dir, slide_index, f"{tag}_FAILURE.txt", last_error)
+                continue
+
+            if result is None:
+                logger.warning(
+                    "slide %d %s: sub-agent returned None (likely API/rate-limit)",
+                    slide_index, tag,
+                )
+                last_error = "sub-agent returned None"
+                _dump(run_dir, slide_index, f"{tag}_FAILURE.txt", last_error)
+                continue
+
+            output_text = str(getattr(result, "final_output", "") or "")
+            _dump(run_dir, slide_index, f"{tag}_raw_response.txt", output_text)
+            logger.debug(
+                "slide %d %s raw output: %d chars\n%s",
+                slide_index, tag, len(output_text), _truncate(output_text),
+            )
+
+            fragment, extraction_steps = _extract_html_fragment(output_text)
+            for step in extraction_steps:
+                logger.debug("slide %d %s extract: %s", slide_index, tag, step)
+
+            if not fragment:
+                logger.warning(
+                    "slide %d %s: empty fragment after extraction (raw starts: %r)",
+                    slide_index, tag, output_text[:120],
+                )
+                last_error = (
+                    "Your previous response was empty or stripped to nothing after "
+                    "extraction. Return the slide body as plain HTML — no markdown "
+                    "fences, no commentary."
+                )
+                _dump(run_dir, slide_index, f"{tag}_FAILURE.txt", last_error)
+                continue
+
+            _dump(run_dir, slide_index, f"{tag}_fragment.html", fragment)
+
+            # Stage 1 preprocessing
+            converted = _convert_css_bg_images_to_img_tags(fragment)
+            if len(converted) != len(fragment):
+                logger.info(
+                    "slide %d %s: converted CSS background-image rules to <img> "
+                    "(%d → %d chars)", slide_index, tag, len(fragment), len(converted)
+                )
+                _dump(run_dir, slide_index, f"{tag}_after_bg_convert.html", converted)
+            fragment = converted
+
+            embedded = _embed_local_images_as_base64(fragment, course_root)
+            if len(embedded) != len(fragment):
+                logger.info(
+                    "slide %d %s: embedded local images as base64 (%d → %d chars)",
+                    slide_index, tag, len(fragment), len(embedded),
+                )
+                _dump(run_dir, slide_index, f"{tag}_after_embed.html", embedded)
+            fragment = embedded
+
+            wrapped = self._wrap_full_html(fragment, brief, font_links)
+            _dump(run_dir, slide_index, f"{tag}_wrapped.html", wrapped)
+
+            # Stage 2 validation (sync Playwright; offloaded to a thread).
+            try:
+                validation = await asyncio.to_thread(
+                    _validate_slide, wrapped, course_root
+                )
+            except Exception as exc:
+                logger.exception(
+                    "slide %d %s: validation crashed (%s) — skipping check",
+                    slide_index, tag, exc,
+                )
+                validation = {"valid": True, "error": f"(validation skipped: {exc})"}
+
+            if validation.get("valid"):
+                logger.info(
+                    "slide %d %s ok: %d chars of HTML (validation passed)",
+                    slide_index, tag, len(fragment),
+                )
+                _dump(run_dir, slide_index, f"{tag}_validation.txt", "valid")
+                return wrapped, ""
+
+            error_text = validation.get("error", "unknown validation error")
+            logger.warning(
+                "slide %d %s: validation failed:\n%s",
+                slide_index, tag, _truncate(error_text, 400),
+            )
+            _dump(run_dir, slide_index, f"{tag}_validation.txt", error_text)
+            last_error = error_text
+            # Strip base64 from the fragment before sending it back to the
+            # sub-agent so we don't burn tokens on multi-MB image blobs.
+            last_fragment_stripped = _strip_base64_images(fragment)
+
+        return None, last_error or f"all {self._MAX_ATTEMPTS} attempts failed"
+
+    def _wrap_full_html(
+        self, body: str, brief: SlideBrief, font_links: str
+    ) -> str:
+        """Wrap a slide body in the _HTML_TEMPLATE with font links.
+
+        Mirrors Pipeline A's input shape exactly — no speaker-notes div,
+        no auxiliary elements. The `brief.speaker_notes` value is preserved
+        in `slide_NNN_brief.json` debug artifacts but is not embedded in
+        the PPTX (see SlideBrief.speaker_notes for why).
+        """
+        return _HTML_TEMPLATE.format(
+            font_links=font_links,
+            css=self.css_content,
+            body=body,
+        )
+
+    def _write_wrapped_to_tmp(
+        self, tmp_path: Path, wrapped_htmls: list[str]
+    ) -> list[str]:
+        """Write pre-wrapped per-slide HTML to a temp dir for the Node runner."""
+        paths: list[str] = []
+        for i, html in enumerate(wrapped_htmls):
             slide_file = tmp_path / f"slide_{i + 1:03d}.html"
             slide_file.write_text(html, encoding="utf-8")
             paths.append(str(slide_file))
@@ -612,25 +1300,6 @@ class GenerateEducatorSlides(BaseTool):
             err = result.stderr.strip() or result.stdout.strip()
             return f"Error converting HTML to PPTX:\n{err}"
         return None
-
-    def _add_speaker_notes(self, pptx_bytes: bytes) -> bytes:
-        """Embed speaker notes from each brief into the PPTX notesSlide."""
-        from io import BytesIO
-
-        from pptx import Presentation
-
-        prs = Presentation(BytesIO(pptx_bytes))
-        for i, slide in enumerate(prs.slides):
-            if i >= len(self.slides):
-                continue
-            notes = self.slides[i].speaker_notes.strip()
-            if not notes:
-                continue
-            slide.notes_slide.notes_text_frame.text = notes
-
-        out = BytesIO()
-        prs.save(out)
-        return out.getvalue()
 
 
 def _fallback_html(brief: SlideBrief) -> str:
