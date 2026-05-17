@@ -735,6 +735,148 @@ def _clean_css_for_runner(css: str) -> str:
     return css
 
 
+_NOTES_SLIDE_PATH_RE = re.compile(r"^ppt/notesSlides/notesSlide(\d+)\.xml$")
+_PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _set_notes_text(xml_bytes: bytes, notes_text: str) -> bytes | None:
+    """Edit a single notesSlideN.xml to set the notes body text.
+
+    Locates the `<p:sp>` whose `<p:ph type="body"/>` placeholder identifies
+    the notes-body shape, then rewrites its `<a:txBody>` paragraphs to one
+    `<a:p>` per newline-separated line of `notes_text`. Returns the new XML
+    bytes, or `None` if the structure doesn't match (we leave the original
+    unchanged in that case).
+    """
+    from lxml import etree
+
+    try:
+        root = etree.fromstring(xml_bytes)
+    except etree.XMLSyntaxError:
+        return None
+
+    P = f"{{{_PML_NS}}}"
+    A = f"{{{_DML_NS}}}"
+
+    body_sp = None
+    for sp in root.iter(f"{P}sp"):
+        ph = sp.find(f".//{P}nvPr/{P}ph")
+        if ph is not None and ph.get("type") == "body":
+            body_sp = sp
+            break
+    if body_sp is None:
+        return None
+
+    # <p:txBody> is in the presentationML namespace (it lives on a <p:sp>),
+    # though its children (<a:bodyPr>, <a:lstStyle>, <a:p>) are drawingML.
+    tx_body = body_sp.find(f".//{P}txBody")
+    if tx_body is None:
+        return None
+
+    # Preserve <a:bodyPr> and <a:lstStyle> (formatting prelude); replace <a:p>*.
+    keep = [c for c in tx_body if c.tag in (f"{A}bodyPr", f"{A}lstStyle")]
+    for c in list(tx_body):
+        tx_body.remove(c)
+    for c in keep:
+        tx_body.append(c)
+
+    for line in notes_text.split("\n"):
+        p = etree.SubElement(tx_body, f"{A}p")
+        if line.strip():
+            r = etree.SubElement(p, f"{A}r")
+            rPr = etree.SubElement(r, f"{A}rPr")
+            rPr.set("lang", "en-US")
+            rPr.set("dirty", "0")
+            t = etree.SubElement(r, f"{A}t")
+            t.text = line
+        endParaRPr = etree.SubElement(p, f"{A}endParaRPr")
+        endParaRPr.set("lang", "en-US")
+        endParaRPr.set("dirty", "0")
+
+    return etree.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+
+
+def _inject_speaker_notes_into_pptx(
+    pptx_bytes: bytes,
+    notes_per_slide: list[str],
+) -> tuple[bytes, dict[str, int]]:
+    """Inject speaker notes into the existing notesSlideN.xml parts of a PPTX.
+
+    dom-to-pptx already creates a `notesSlideN.xml` for every slide and wires
+    it up via slide rels + notesMaster + content-types — we just write the
+    text into the empty placeholder. **Every other ZIP entry is copied
+    byte-for-byte**, so the runner's embedded fonts (`<p:embeddedFontLst>`),
+    custom shape XML, theme overrides, etc. are all preserved exactly.
+    This is the deliberate alternative to round-tripping through
+    `python-pptx`, which dropped those elements on save.
+
+    Returns `(new_pptx_bytes, stats)` where stats has counts of injected /
+    skipped-empty / no-body-placeholder / missing-notesSlide.
+    """
+    import zipfile
+    from io import BytesIO
+
+    stats = {
+        "injected": 0,
+        "skipped_empty": 0,
+        "no_body_placeholder": 0,
+        "missing_notes_part": 0,
+    }
+    note_paths = {
+        i + 1: f"ppt/notesSlides/notesSlide{i + 1}.xml"
+        for i in range(len(notes_per_slide))
+    }
+    expected_paths = set(note_paths.values())
+
+    src_buf = BytesIO(pptx_bytes)
+    out_buf = BytesIO()
+
+    with zipfile.ZipFile(src_buf, "r") as src, zipfile.ZipFile(
+        out_buf, "w", zipfile.ZIP_DEFLATED
+    ) as dst:
+        present_paths = set(src.namelist())
+        # Slides whose notesSlide is missing entirely (runner skipped it).
+        for idx, path in note_paths.items():
+            if path not in present_paths and notes_per_slide[idx - 1].strip():
+                stats["missing_notes_part"] += 1
+                logger.warning(
+                    "speaker notes: slide %d has notes but %s is missing; "
+                    "skipping (runner did not generate it)",
+                    idx, path,
+                )
+
+        for item in src.infolist():
+            data = src.read(item.filename)
+            match = _NOTES_SLIDE_PATH_RE.match(item.filename)
+            if match:
+                slide_idx = int(match.group(1))
+                if 1 <= slide_idx <= len(notes_per_slide):
+                    notes_text = notes_per_slide[slide_idx - 1].strip()
+                    if not notes_text:
+                        stats["skipped_empty"] += 1
+                    else:
+                        new_data = _set_notes_text(data, notes_text)
+                        if new_data is None:
+                            stats["no_body_placeholder"] += 1
+                            logger.warning(
+                                "speaker notes: %s has no <p:sp> with body "
+                                "placeholder; leaving notes empty for slide %d",
+                                item.filename, slide_idx,
+                            )
+                        else:
+                            data = new_data
+                            stats["injected"] += 1
+            # Preserve original ZipInfo (compression, dates, attrs) by
+            # constructing the entry from scratch with the same filename
+            # but new bytes. Using item directly carries the original CRC.
+            dst.writestr(item.filename, data)
+
+    return out_buf.getvalue(), stats
+
+
 def _extract_google_fonts_links(css_content: str) -> str:
     """Promote any @import url('...fonts.googleapis.com...') rules in the
     course CSS to explicit <link rel="stylesheet"> tags.
@@ -815,13 +957,10 @@ class SlideBrief(BaseModel):
     speaker_notes: str = Field(
         ...,
         description=(
-            "3-5 sentences of the lecturer's script. Captured in debug "
-            "artifacts (.slides_debug/<ts>/slide_NNN_brief.json) for future "
-            "use; NOT currently embedded in the PPTX. The previous "
-            "python-pptx round-trip that embedded these was dropping "
-            "embedded fonts and shape styling from the runner's output, so "
-            "the pass was removed. Keep populating this field — when a "
-            "non-lossy embed mechanism lands the data will be ready."
+            "3-5 sentences of the lecturer's script. Embedded as the PPTX "
+            "notesSlide for each slide (visible in PowerPoint's notes pane). "
+            "Use newlines to split into paragraphs. Also captured in "
+            ".slides_debug/<ts>/slide_NNN_brief.json for archival."
         ),
     )
 
@@ -1207,14 +1346,32 @@ class GenerateEducatorSlides(BaseTool):
                     return f"Failed to read generated PPTX: {exc}"
                 logger.debug("PPTX generated: %d bytes", len(pptx_bytes))
 
-        # Diagnostic dump: with no post-processing this should be byte-equal
-        # to the final written PPTX. If they ever diverge after a future
-        # change, that's the signal to investigate.
+        # Diagnostic dump: snapshot the runner's untouched output so we can
+        # diff it against the final PPTX after notes injection. Useful for
+        # verifying we only touched notesSlideN.xml parts.
         if run_dir is not None:
             try:
                 (run_dir / "slides_pre_postprocess.pptx").write_bytes(pptx_bytes)
             except OSError as exc:
                 logger.debug("Could not dump slides_pre_postprocess.pptx: %s", exc)
+
+        # Inject speaker notes via ZIP/XML manipulation. Unlike the previous
+        # python-pptx round-trip (which dropped embedded fonts and custom
+        # shape XML), this only edits the existing notesSlideN.xml parts
+        # in place. Every other ZIP entry is copied byte-for-byte.
+        notes_per_slide = [s.speaker_notes for s in self.slides]
+        if any(n.strip() for n in notes_per_slide):
+            pptx_bytes, notes_stats = _inject_speaker_notes_into_pptx(
+                pptx_bytes, notes_per_slide
+            )
+            logger.info(
+                "speaker notes: %d injected, %d skipped-empty, "
+                "%d missing-body-placeholder, %d missing-notesSlide",
+                notes_stats["injected"],
+                notes_stats["skipped_empty"],
+                notes_stats["no_body_placeholder"],
+                notes_stats["missing_notes_part"],
+            )
 
         backend = get_backend()
         outcome = backend.write_file(Path(self.output_path), pptx_bytes)
