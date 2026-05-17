@@ -126,6 +126,77 @@ def _dump(run_dir: Path | None, slide_index: int, name: str, content: str) -> No
     except OSError as exc:
         logger.debug("Could not dump %s for slide %d: %s", name, slide_index, exc)
 
+
+def _surface_runner_output(stdout: str, stderr: str) -> None:
+    """Parse + log the Node runner's stdout/stderr.
+
+    The runner emits structured prefixed lines we care about:
+      [fonts] "Inter" — 78 KB           (font pre-download)
+      [fonts] 3 font(s) ready for embedding
+      [fa] Icons materialized in slide bodies
+      [page error] ReferenceError: …    (browser-side error)
+      [page console] Uncaught …         (browser console.error)
+      [debug] Orchestrator HTML kept …  (our env-gated artifact)
+
+    Anything else is logged at DEBUG. Page errors/warnings are logged at
+    WARNING so they show up in the stderr console.
+    """
+    if not stdout and not stderr:
+        return
+    fonts_total: int | None = None
+    fonts_downloaded: list[str] = []
+    page_errors: list[str] = []
+    other_warnings: list[str] = []
+
+    for line in (stdout + "\n" + stderr).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("[fonts] ") or s.startswith("[fa] "):
+            # Font download log lines (info-worthy)
+            logger.info("runner: %s", s)
+            m = re.match(r"\[fonts\]\s+(\d+)\s+font\(s\)\s+ready", s)
+            if m:
+                fonts_total = int(m.group(1))
+            m2 = re.match(r"\[fonts\]\s+\"([^\"]+)\"", s)
+            if m2:
+                fonts_downloaded.append(m2.group(1))
+        elif s.startswith("[page error]") or s.startswith("[page console]"):
+            page_errors.append(s)
+            logger.warning("runner: %s", s)
+        elif s.startswith("[debug]"):
+            logger.info("runner: %s", s)
+        elif s.startswith("Saved:") or s.startswith("Converted "):
+            logger.debug("runner: %s", s)
+        elif "warn" in s.lower() or "error" in s.lower():
+            other_warnings.append(s)
+            logger.warning("runner: %s", s)
+        else:
+            logger.debug("runner: %s", s)
+
+    if fonts_total is not None:
+        if fonts_total == 0:
+            logger.warning(
+                "runner embedded 0 fonts — PPTX will use PowerPoint's default fallback "
+                "(usually Calibri/Times). Check the wrapped HTML has working "
+                "<link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/...\"> tags."
+            )
+        else:
+            logger.info(
+                "runner embedded %d font(s): %s",
+                fonts_total, ", ".join(fonts_downloaded) or "(names not logged)",
+            )
+    elif fonts_downloaded:
+        logger.info("runner downloaded font(s): %s", ", ".join(fonts_downloaded))
+    else:
+        logger.warning(
+            "runner output had no [fonts] log lines — pre-download may have failed "
+            "or no Google Fonts <link> tags were emitted in the wrapped HTML."
+        )
+
+    if page_errors:
+        logger.warning("runner reported %d page-level error(s) above", len(page_errors))
+
 _HTML_TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -625,6 +696,45 @@ def _backend_root() -> Path:
     return Path(root)
 
 
+_CSS_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
+# Match @import url(...);  — must use [^)]+ (not [^;]+) because Google Fonts
+# URLs contain `;` characters in their weight specs (e.g. wght@400;500;600;700).
+_CSS_GOOGLE_FONT_IMPORT_RE = re.compile(
+    r'@import\s+url\(\s*["\']?https?://fonts\.googleapis\.com/[^)]+\)\s*;?',
+    re.IGNORECASE,
+)
+
+
+def _clean_css_for_runner(css: str) -> str:
+    """Pre-process CSS before handing it to the Node runner.
+
+    Two transformations:
+
+    1. **Strip `/* ... */` comments.** The runner's `scopeSlideStyle()`
+       (html2pptx_runner.js:84-120) extracts the selector text between
+       `}` and the next `{` by raw substring. CSS comments between rules
+       — and especially the `@import` declarations that often follow
+       them — get glued onto the next rule's selector, producing invalid
+       CSS that the browser silently drops. We strip comments here so
+       the scoper sees clean rule sequences.
+
+    2. **Strip `@import url("…fonts.googleapis.com…");`** declarations.
+       We already promote these to explicit `<link rel="stylesheet">` tags
+       in the wrapper template's `<head>` (see `_extract_google_fonts_links`),
+       so leaving them in the inlined `<style>` block is redundant AND
+       puts a brace-less `@import …;` statement between rules — which
+       the scoper also mishandles for the same reason as (1).
+
+    Limitation: naive comment stripping does not understand string-literal
+    contexts (e.g. `content: "/* not a comment */"`). Slide CSS doesn't
+    typically use that pattern; if a course ever needs it we'll switch
+    to a proper CSS tokeniser.
+    """
+    css = _CSS_COMMENT_RE.sub("", css)
+    css = _CSS_GOOGLE_FONT_IMPORT_RE.sub("", css)
+    return css
+
+
 def _extract_google_fonts_links(css_content: str) -> str:
     """Promote any @import url('...fonts.googleapis.com...') rules in the
     course CSS to explicit <link rel="stylesheet"> tags.
@@ -649,13 +759,12 @@ def _extract_google_fonts_links(css_content: str) -> str:
         hrefs.append(href)
     if not hrefs:
         return ""
-    parts = [
-        '<link rel="preconnect" href="https://fonts.googleapis.com">',
-        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>',
-    ]
-    for href in hrefs:
-        parts.append(f'<link rel="stylesheet" href="{href}">')
-    return "\n".join(parts)
+    # Note: we deliberately do NOT emit <link rel="preconnect"> tags.
+    # The runner's collectGoogleFontsHrefs filter (html2pptx_runner.js:564-574)
+    # matches any <link> with `fonts.googleapis.com` in the href, so preconnect
+    # tags get treated as stylesheet URLs and produce HTTP 404s in the runner
+    # log. The preconnect-as-perf-hint is irrelevant in headless Chromium anyway.
+    return "\n".join(f'<link rel="stylesheet" href="{href}">' for href in hrefs)
 
 
 class SlideBrief(BaseModel):
@@ -1058,12 +1167,20 @@ class GenerateEducatorSlides(BaseTool):
         )
         failure_note = "\n".join(f"  - {f}" for f in failures) if failures else ""
 
-        with tempfile.TemporaryDirectory(prefix="educator_slides_") as tmp:
-            tmp_path = Path(tmp)
-            html_files = self._write_wrapped_to_tmp(tmp_path, wrapped_htmls)
-            pptx_path = tmp_path / "slides.pptx"
-            logger.debug("running html2pptx_runner.js on %d files", len(html_files))
-            error = self._run_converter(html_files, pptx_path)
+        # Prefer a sticky directory under the run's debug dir so we can
+        # inspect what the runner actually loaded (slide HTML, orchestrator
+        # HTML, stdout/stderr) after the fact. Falls back to a TemporaryDirectory
+        # only when artifact dumping is disabled (no run_dir).
+        if run_dir is not None:
+            runner_input = run_dir / "runner_input"
+            runner_input.mkdir(parents=True, exist_ok=True)
+            html_files = self._write_wrapped_to_tmp(runner_input, wrapped_htmls)
+            pptx_path = runner_input / "slides.pptx"
+            logger.debug(
+                "running html2pptx_runner.js on %d files in %s",
+                len(html_files), runner_input,
+            )
+            error = self._run_converter(html_files, pptx_path, run_dir=run_dir)
             if error:
                 logger.error("html2pptx_runner.js failed: %s", error)
                 return error
@@ -1073,6 +1190,22 @@ class GenerateEducatorSlides(BaseTool):
                 logger.exception("could not read generated PPTX")
                 return f"Failed to read generated PPTX: {exc}"
             logger.debug("PPTX generated: %d bytes", len(pptx_bytes))
+        else:
+            with tempfile.TemporaryDirectory(prefix="educator_slides_") as tmp:
+                tmp_path = Path(tmp)
+                html_files = self._write_wrapped_to_tmp(tmp_path, wrapped_htmls)
+                pptx_path = tmp_path / "slides.pptx"
+                logger.debug("running html2pptx_runner.js on %d files", len(html_files))
+                error = self._run_converter(html_files, pptx_path)
+                if error:
+                    logger.error("html2pptx_runner.js failed: %s", error)
+                    return error
+                try:
+                    pptx_bytes = pptx_path.read_bytes()
+                except OSError as exc:
+                    logger.exception("could not read generated PPTX")
+                    return f"Failed to read generated PPTX: {exc}"
+                logger.debug("PPTX generated: %d bytes", len(pptx_bytes))
 
         # Diagnostic dump: with no post-processing this should be byte-equal
         # to the final written PPTX. If they ever diverge after a future
@@ -1256,10 +1389,13 @@ class GenerateEducatorSlides(BaseTool):
         no auxiliary elements. The `brief.speaker_notes` value is preserved
         in `slide_NNN_brief.json` debug artifacts but is not embedded in
         the PPTX (see SlideBrief.speaker_notes for why).
+
+        The course CSS is cleaned before inlining — see
+        `_clean_css_for_runner` for the (important) reason.
         """
         return _HTML_TEMPLATE.format(
             font_links=font_links,
-            css=self.css_content,
+            css=_clean_css_for_runner(self.css_content),
             body=body,
         )
 
@@ -1274,7 +1410,21 @@ class GenerateEducatorSlides(BaseTool):
             paths.append(str(slide_file))
         return paths
 
-    def _run_converter(self, html_files: list[str], output_path: Path) -> str | None:
+    def _run_converter(
+        self,
+        html_files: list[str],
+        output_path: Path,
+        run_dir: Path | None = None,
+    ) -> str | None:
+        """Invoke html2pptx_runner.js. Captures stdout/stderr always and
+        surfaces structured log lines so we can see exactly what the runner
+        did — font downloads, page errors, FA materialization, embedded-font
+        count, etc. When `run_dir` is given, full stdout/stderr are also
+        dumped as `runner_stdout.log` / `runner_stderr.log` for offline
+        inspection, and `KEEP_ORCHESTRATOR=1` is set so the runner leaves
+        the orchestrator HTML on disk (it lives next to the slide files —
+        look for `._orchestrator_*.html`).
+        """
         cmd = [
             "node",
             str(RUNNER_JS),
@@ -1283,6 +1433,11 @@ class GenerateEducatorSlides(BaseTool):
             "--",
             *html_files,
         ]
+        env = os.environ.copy()
+        if run_dir is not None:
+            env["KEEP_ORCHESTRATOR"] = "1"
+
+        logger.debug("runner cmd: %s", " ".join(cmd))
         try:
             result = subprocess.run(
                 cmd,
@@ -1290,14 +1445,27 @@ class GenerateEducatorSlides(BaseTool):
                 text=True,
                 timeout=300,
                 cwd=str(RUNNER_JS.parent.parent.parent),
+                env=env,
             )
         except subprocess.TimeoutExpired:
+            logger.error("runner timed out after 300s")
             return "Error: PPTX conversion timed out after 300 s."
         except FileNotFoundError:
+            logger.error("node binary not found")
             return "Error: Node.js not found. Please install Node.js."
 
+        # Always dump and parse the runner's output, even on success.
+        stdout, stderr = result.stdout or "", result.stderr or ""
+        if run_dir is not None:
+            try:
+                (run_dir / "runner_stdout.log").write_text(stdout, encoding="utf-8")
+                (run_dir / "runner_stderr.log").write_text(stderr, encoding="utf-8")
+            except OSError as exc:
+                logger.debug("could not dump runner logs: %s", exc)
+        _surface_runner_output(stdout, stderr)
+
         if result.returncode != 0:
-            err = result.stderr.strip() or result.stdout.strip()
+            err = stderr.strip() or stdout.strip()
             return f"Error converting HTML to PPTX:\n{err}"
         return None
 

@@ -1175,7 +1175,14 @@ async function main() {
         await context.close();
     } finally {
         await browser.close();
-        try { fs.unlinkSync(orchFile); } catch (_) {}
+        // Set KEEP_ORCHESTRATOR=1 in the parent process to retain the
+        // orchestrator HTML for debugging. Default behaviour (no env var)
+        // deletes it as before — Pipeline A and any other caller is unaffected.
+        if (process.env.KEEP_ORCHESTRATOR === '1') {
+            console.log(`[debug] Orchestrator HTML kept at: ${orchFile}`);
+        } else {
+            try { fs.unlinkSync(orchFile); } catch (_) {}
+        }
     }
 }
 
